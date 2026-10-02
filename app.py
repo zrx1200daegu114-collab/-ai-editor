@@ -1,8 +1,9 @@
-import os, json, secrets, shutil, subprocess, tempfile, threading, time, uuid
+import os, json, secrets, shutil, subprocess, tempfile, threading, time, uuid, selectors
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, session, redirect, render_template_string
 from datetime import timedelta
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
@@ -82,6 +83,38 @@ def run(args, timeout=900):
         raise ValueError('動画を読み込めませんでした。別の動画で試してください。')
     return p.stdout
 
+def run_conversion(args, job, completed, duration, total, timeout=900):
+    started = time.monotonic()
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(args[:-1] + ['-progress', 'pipe:1', '-nostats', args[-1]],
+                                   stdout=subprocess.PIPE, stderr=errors)
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                pending = b''
+                while True:
+                    if time.monotonic() - started > timeout:
+                        raise subprocess.TimeoutExpired(args, timeout)
+                    if not selector.select(timeout=1):
+                        continue
+                    chunk = os.read(process.stdout.fileno(), 8192)
+                    if not chunk: break
+                    pending += chunk
+                    while b'\n' in pending:
+                        line, pending = pending.split(b'\n', 1)
+                        if line.startswith(b'out_time_us='):
+                            try:
+                                seconds = min(duration, max(0, int(line.split(b'=', 1)[1]) / 1000000))
+                                job['percent'] = min(99, round(100 * (completed + seconds) / total))
+                            except ValueError: pass
+            if process.wait(timeout=5):
+                raise ValueError('動画の変換に失敗しました。短い動画で試してください。')
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdout.close()
+
 def probe(path):
     return json.loads(run(['ffprobe','-v','error','-show_streams','-show_format','-of','json',str(path)],30))
 
@@ -116,6 +149,7 @@ def render(key, files, aspect):
             if abs(rotation)%180 == 90: w,h=h,w
             aspect = 'vertical' if h>w else ('square' if h==w else 'horizontal')
         w,h = {'vertical':(720,1280),'horizontal':(1280,720),'square':(720,720)}[aspect]
+        completed = 0
         for i,(source,info) in enumerate(zip(files,infos)):
             job['message'] = f'{i+1}/{len(files)}本目を変換中'
             audio = any(s['codec_type']=='audio' for s in info['streams'])
@@ -124,15 +158,16 @@ def render(key, files, aspect):
             if not audio: cmd += ['-f','lavfi','-i','anullsrc=r=48000:cl=stereo']
             cmd += ['-map','0:v:0','-map','0:a:0' if audio else '1:a:0',
                     '-vf',f'scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p',
-                    '-af','aresample=48000,apad','-t',str(d),'-c:v','libx264','-preset','veryfast','-crf','24','-threads','1',
+                    '-af','aresample=48000,apad','-t',str(d),'-c:v','libx264','-preset','superfast','-crf','24','-threads','1',
                     '-c:a','aac','-ac','2','-ar','48000','-b:a','128k',str(folder/f'clip{i}.mp4')]
-            run(cmd)
+            run_conversion(cmd, job, completed, d, duration)
+            completed += d
             source.unlink(missing_ok=True)
         job['message']='MP4を仕上げています'
         listing = folder/'concat.txt'
         listing.write_text(''.join(f"file 'clip{i}.mp4'\n" for i in range(len(files))))
         run(['ffmpeg','-hide_banner','-loglevel','error','-y','-f','concat','-safe','1','-i',str(listing),'-c','copy','-movflags','+faststart',str(folder/'result.mp4')])
-        job.update(status='done',message='動画が完成しました')
+        job.update(status='done',message='動画が完成しました',percent=100)
     except subprocess.TimeoutExpired:
         job.update(status='error',message='処理時間を超えました。短い動画で試してください。')
     except Exception as e:
@@ -155,16 +190,16 @@ def too_large(e): return jsonify(error='動画の合計サイズを2GB以内に�
 @app.post('/api/jobs')
 def create():
     clean()
-    incoming = request.files.getlist('videos')
-    aspect = request.form.get('aspect','original')
-    if not 1<=len(incoming)<=5 or aspect not in ('original','vertical','horizontal','square'):
-        return jsonify(error='動画は1〜5本選んでください。'),400
     if not BUSY.acquire(blocking=False):
-        return jsonify(error='別の動画を処理中です。完成後にもう一度試してください。'),429
+        return jsonify(error='前に送った動画を処理中です。ページを開き直すと状況を確認できます。'),429
     key=uuid.uuid4().hex
     folder=ROOT/key
-    folder.mkdir()
     try:
+        incoming = request.files.getlist('videos')
+        aspect = request.form.get('aspect','original')
+        if not 1<=len(incoming)<=5 or aspect not in ('original','vertical','horizontal','square'):
+            raise ValueError('動画は1〜5本選んでください。')
+        folder.mkdir()
         paths=[]
         total=0
         for i,file in enumerate(incoming):
@@ -183,13 +218,24 @@ def create():
         if total>MAX_UPLOAD_BYTES or any(p.stat().st_size==0 for p in paths):
             raise ValueError('空の動画は使えません。合計サイズは2GB以内にしてください。')
         token=secrets.token_urlsafe(32)
-        JOBS[key]={'token':token,'status':'processing','message':'動画を確認しています','created':time.time()}
+        JOBS[key]={'token':token,'status':'processing','message':'動画を確認しています','created':time.time(),'percent':0}
         threading.Thread(target=render,args=(key,paths,aspect),daemon=True).start()
         return jsonify(id=key,token=token),202
     except Exception as e:
         BUSY.release()
         shutil.rmtree(folder,ignore_errors=True)
+        if isinstance(e, HTTPException): raise
         return jsonify(error=str(e) if isinstance(e,ValueError) else '動画の受信に失敗しました。'),400
+
+@app.get('/api/jobs/current')
+def current_job():
+    clean()
+    with LOCK:
+        entries = list(JOBS.items())
+    if not entries: return jsonify(job=None)
+    processing = [(key, job) for key, job in entries if job['status'] == 'processing']
+    key, job = max(processing or entries, key=lambda entry: entry[1]['created'])
+    return jsonify(job={'id':key, 'token':job['token'], 'status':job['status']})
 
 def authorized(key):
     clean()
@@ -201,7 +247,7 @@ def authorized(key):
 def status(key):
     job=authorized(key)
     if not job: return jsonify(error='動画が見つかりません。保存期限は1時間です。'),404
-    return jsonify(status=job['status'],message=job['message'])
+    return jsonify(status=job['status'],message=job['message'],percent=job.get('percent',0),elapsed=int(time.time()-job['created']))
 
 @app.get('/api/jobs/<key>/video')
 def video(key):
@@ -218,6 +264,71 @@ HTML = '''<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewp
 <script>
 let selected=[],busy=false;const $=id=>document.getElementById(id);function draw(){const total=selected.reduce((n,f)=>n+f.size,0);$('size').textContent=selected.length?selected.length+'本・合計 '+(total/(1024*1024)).toFixed(1)+' MB（上限 2GB）':''; $('list').replaceChildren();selected.forEach((f,i)=>{const row=document.createElement('div');row.className='file';const name=document.createElement('span');name.textContent=(i+1)+'．'+f.name;row.append(name);for(const [label,delta] of [['↑',-1],['↓',1]]){const b=document.createElement('button');b.textContent=label;b.setAttribute('aria-label',f.name+'を'+(delta<0?'前':'後')+'へ');b.disabled=busy||i+delta<0||i+delta>=selected.length;b.onclick=()=>{[selected[i],selected[i+delta]]=[selected[i+delta],selected[i]];draw()};row.append(b)}$('list').append(row)});$('go').disabled=busy||!selected.length;$('files').disabled=busy;$('aspect').disabled=busy}
 $('files').onchange=()=>{selected=[...$('files').files];draw()};const pause=ms=>new Promise(r=>setTimeout(r,ms));
-$('go').onclick=async()=>{if(selected.length>5||selected.reduce((n,f)=>n+f.size,0)>2*1024*1024*1024){alert('選択した動画は合計 '+(selected.reduce((n,f)=>n+f.size,0)/(1024*1024)).toFixed(1)+' MBです。1〜5本、合計2GB以内で選んでください。');return}busy=true;draw();$('out').classList.remove('hidden');$('preview').classList.add('hidden');$('preview').removeAttribute('src');$('save').classList.add('hidden');$('progress').classList.remove('hidden');$('message').textContent='動画を送信しています';$('hint').textContent='この画面を開いたままお待ちください。動画の長さによって数分かかります。';$('out').scrollIntoView({behavior:'smooth'});try{const body=new FormData();selected.forEach(f=>body.append('videos',f));body.append('aspect',$('aspect').value);const r=await fetch('/api/jobs',{method:'POST',headers:{'X-CSRF-Token':'__CSRF__'},body});const job=await r.json();if(!r.ok)throw Error(job.error||'送信に失敗しました');const base='/api/jobs/'+job.id;const query='?token='+encodeURIComponent(job.token);for(;;){await pause(2000);const response=await fetch(base+query);const status=await response.json();if(!response.ok)throw Error(status.error);$('message').textContent=status.message;if(status.status==='error')throw Error(status.message);if(status.status==='done'){const url=base+'/video'+query;$('preview').src=url;$('preview').classList.remove('hidden');$('save').href=url+'&download=1';$('save').download='wedding-edited.mp4';$('save').classList.remove('hidden');$('hint').textContent='保存期限は1時間です。iPhoneでは「MP4を保存」でダウンロード後、ファイルアプリから共有→「ビデオを保存」で写真に入れられます。';break}}}catch(e){$('message').textContent=e.message;$('hint').textContent='通信が切れた場合は、動画を選び直してもう一度試してください。'}finally{busy=false;$('progress').classList.add('hidden');draw()}};
+
+function showOutput(){
+ $('out').classList.remove('hidden');$('preview').classList.add('hidden');
+ $('preview').removeAttribute('src');$('save').classList.add('hidden');
+ $('progress').classList.remove('hidden');$('progress').removeAttribute('value');
+ $('out').scrollIntoView({behavior:'smooth'});
+}
+async function getCurrent(){
+ const response=await fetch('/api/jobs/current');
+ if(!response.ok)throw Error(response.status===401?'ログインが必要です。ページを開き直してください。':'処理状況を確認できません。少し待ってから再試行してください。');
+ return (await response.json()).job;
+}
+async function watch(job){
+ const base='/api/jobs/'+job.id,query='?token='+encodeURIComponent(job.token);
+ for(;;){
+  const response=await fetch(base+query);
+  if(!response.ok)throw Error(response.status===404?'処理情報が消えました。サーバー再起動などで中断された可能性があります。':'処理状況を取得できません。ページを開き直してください。');
+  const status=await response.json();
+  $('message').textContent=status.message;
+  $('progress').max=100;$('progress').value=status.percent;
+  $('hint').textContent='変換 '+status.percent+'%・処理開始から '+Math.floor(status.elapsed/60)+'分 '+status.elapsed%60+'秒。開き直してもこの画面へ戻れます。';
+  if(status.status==='error')throw Error(status.message);
+  if(status.status==='done'){
+   const url=base+'/video'+query;$('preview').src=url;$('preview').classList.remove('hidden');
+   $('save').href=url+'&download=1';$('save').download='wedding-edited.mp4';$('save').classList.remove('hidden');
+   $('hint').textContent='保存期限は処理開始から約1時間です。「MP4を保存」で保存してください。';return;
+  }
+  await pause(2000);
+ }
+}
+function sendVideos(body){return new Promise((resolve,reject)=>{
+ const xhr=new XMLHttpRequest();xhr.open('POST','/api/jobs');xhr.setRequestHeader('X-CSRF-Token','__CSRF__');
+ xhr.timeout=30*60*1000;
+ xhr.upload.onprogress=event=>{
+  if(event.lengthComputable){const percent=Math.round(event.loaded/event.total*100);$('progress').max=100;$('progress').value=percent;$('message').textContent='動画を送信しています '+percent+'%';}
+ };
+ xhr.upload.onload=()=>{$('message').textContent='サーバーで動画の受信を確認しています';};
+ xhr.onerror=()=>reject(Error('送信中に通信が切れました。ページを開き直して処理状況を確認してください。'));
+ xhr.ontimeout=()=>reject(Error('送信に30分以上かかりました。通信環境を確認してください。'));
+ xhr.onload=()=>{try{const data=JSON.parse(xhr.responseText);if(xhr.status<200||xhr.status>=300)reject(Error(data.error||'送信に失敗しました'));else resolve(data);}catch(e){reject(Error('サーバーから正常な応答がありません。ページを開き直して処理状況を確認してください。'));}};
+ xhr.send(body);
+});}
+async function task(work){
+ busy=true;draw();showOutput();
+ try{await work();}catch(e){$('message').textContent=e.message;$('hint').textContent='再送信する前に、ページを開き直すと前の処理状況を確認できます。';}
+ finally{busy=false;$('progress').classList.add('hidden');draw();}
+}
+$('go').onclick=()=>task(async()=>{
+ $('message').textContent='前の処理を確認しています';
+ const existing=await getCurrent();
+ if(existing&&existing.status==='processing'){await watch(existing);return;}
+ const total=selected.reduce((n,f)=>n+f.size,0);
+ if(!selected.length||selected.length>5||total>2*1024*1024*1024)throw Error('1〜5本、合計2GB以内で選んでください。');
+ const body=new FormData();selected.forEach(f=>body.append('videos',f));body.append('aspect',$('aspect').value);
+ $('message').textContent='動画を送信しています 0%';$('hint').textContent='送信が終わるまでSafariを開いたままお待ちください。';
+ try{await watch(await sendVideos(body));}catch(error){
+  const active=await getCurrent().catch(()=>null);
+  if(active&&active.status==='processing'){await watch(active);return;}throw error;
+ }
+});
+(async()=>{
+ busy=true;draw();
+ try{const job=await getCurrent();if(job){await task(()=>watch(job));}}
+ catch(e){showOutput();$('message').textContent=e.message;}
+ finally{busy=false;draw();}
+})();
 </script></html>'''
 if __name__=='__main__': app.run(host='0.0.0.0',port=int(os.environ.get('PORT',10000)))
