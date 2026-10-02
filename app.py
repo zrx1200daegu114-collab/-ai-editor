@@ -130,7 +130,7 @@ def run_conversion(args, job, completed, duration, total, timeout=7200):
                         if line.startswith(b'out_time_us='):
                             try:
                                 seconds = min(duration, max(0, int(line.split(b'=', 1)[1]) / 1000000))
-                                job['percent'] = min(99, round(100 * (completed + seconds) / total))
+                                job['percent'] = min(99, round(100 * (completed + seconds) / total, 2))
                             except ValueError: pass
             if process.wait(timeout=5):
                 raise ValueError('動画の変換に失敗しました。短い動画で試してください。')
@@ -143,9 +143,9 @@ def run_conversion(args, job, completed, duration, total, timeout=7200):
 def probe(path):
     return json.loads(run(['ffprobe','-v','error','-show_streams','-show_data','-show_format','-of','json',str(path)],30))
 
-def copy_compatible(infos):
+def copy_compatible(infos, video_only=False):
     fields = ('codec_type','codec_name','profile','level','width','height','pix_fmt',
-              'sample_aspect_ratio','r_frame_rate','avg_frame_rate','time_base',
+              'sample_aspect_ratio','r_frame_rate','field_order',
               'sample_fmt','sample_rate','channels','channel_layout','extradata',
               'color_range','color_space','color_transfer','color_primaries')
     signatures = []
@@ -155,25 +155,46 @@ def copy_compatible(infos):
         audios = [stream for stream in streams if stream['codec_type']=='audio']
         if len(videos)!=1 or len(audios)>1: return False
         if videos[0]['codec_name'] not in ('h264','hevc'): return False
-        if audios and audios[0]['codec_name']!='aac': return False
+        if not video_only and audios and audios[0]['codec_name']!='aac': return False
+        if video_only: streams = videos
         if any(not stream.get('extradata') for stream in streams): return False
-        signatures.append([(tuple(stream.get(field) for field in fields),
-                            stream.get('tags',{}).get('rotate'),
-                            stream.get('side_data_list',[])) for stream in streams])
+        # Average FPS is derived from each clip's duration, not codec compatibility.
+        # Container time bases are normalized by the remux below.
+        signature = []
+        for stream in streams:
+            rotation = float(stream.get('tags',{}).get('rotate',0))
+            for side in stream.get('side_data_list',[]):
+                rotation = float(side.get('rotation',rotation))
+            color_metadata = [side for side in stream.get('side_data_list',[])
+                              if side.get('side_data_type') in ('Mastering display metadata','Content light level metadata','DOVI configuration record')]
+            signature.append((tuple(stream.get(field) for field in fields), rotation % 360, color_metadata))
+        signatures.append(signature)
     return bool(signatures) and all(signature==signatures[0] for signature in signatures)
 
 def copy_merge(folder, files, infos, job, duration):
-    job['message']='元画質のまま高速結合しています'
+    normalize_audio = not copy_compatible(infos)
+    job['message']='映像は元画質のまま、音声を揃えて結合しています' if normalize_audio else '元画質のまま高速結合しています'
     completed = 0
     for i,(source,info) in enumerate(zip(files,infos)):
         d=float(info['format']['duration'])
-        cmd=['ffmpeg','-hide_banner','-loglevel','error','-y','-i',str(source),
-             '-map','0:v:0','-map','0:a:0?','-c','copy']
+        cmd=['ffmpeg','-hide_banner','-loglevel','error','-y','-i',str(source)]
+        audio = any(s['codec_type']=='audio' for s in info['streams'])
+        if normalize_audio and not audio:
+            cmd += ['-f','lavfi','-i','anullsrc=r=48000:cl=stereo']
+        cmd += ['-map','0:v:0','-map',('0:a:0' if audio else '1:a:0') if normalize_audio else '0:a:0?',
+                '-c:v','copy','-video_track_timescale','90000']
+        if normalize_audio:
+            cmd += ['-c:a','aac','-ac','2','-ar','48000','-b:a','128k','-af','aresample=48000,apad','-t',str(d)]
+        else:
+            cmd += ['-c:a','copy']
         if next(stream for stream in info['streams'] if stream['codec_type']=='video')['codec_name']=='hevc':
             cmd += ['-tag:v','hvc1']
         cmd += [str(folder/f'fast{i}.mp4')]
         run_conversion(cmd,job,completed,d,duration)
         completed += d
+    normalized = [probe(folder/f'fast{i}.mp4') for i in range(len(files))]
+    if not copy_compatible(normalized):
+        raise ValueError('映像または音声の形式を揃える必要があります')
     listing=folder/'fast-concat.txt'
     listing.write_text(''.join(f"file 'fast{i}.mp4'\n" for i in range(len(files))))
     cmd=['ffmpeg','-hide_banner','-loglevel','error','-y','-f','concat','-safe','1',
@@ -184,6 +205,20 @@ def copy_merge(folder, files, infos, job, duration):
     result=probe(folder/'result.mp4')
     if abs(float(result['format']['duration'])-duration)>max(1,duration*.02):
         raise ValueError('高速結合の長さを確認できませんでした。')
+
+def aspect_matches(infos, aspect):
+    if aspect == 'original': return True
+    target = {'vertical':9/16, 'horizontal':16/9, 'square':1}[aspect]
+    for info in infos:
+        video = next(s for s in info['streams'] if s['codec_type']=='video')
+        if video.get('sample_aspect_ratio') not in (None, '1:1'): return False
+        rotation = float(video.get('tags',{}).get('rotate',0))
+        for side in video.get('side_data_list',[]):
+            rotation = float(side.get('rotation',rotation))
+        w,h = video['width'],video['height']
+        if abs(rotation)%180 == 90: w,h=h,w
+        if abs(w/h-target)>0.001: return False
+    return True
 
 def clean():
     now = time.time()
@@ -212,12 +247,16 @@ def render(key, files, aspect):
             cap = TEMPO_SECONDS[job['genre']] if style=='tempo' else 15
             for info in infos: info['format']['duration'] = str(min(float(info['format']['duration']),cap))
             duration = sum(float(info['format']['duration']) for info in infos)
-        if aspect == 'original' and style=='full' and copy_compatible(infos):
+        same_aspect = aspect_matches(infos, aspect)
+        reason = '画角変更または編集効果のため' if not same_aspect or style!='full' else '映像の形式・解像度・撮影設定が異なるため'
+        if same_aspect and style=='full' and copy_compatible(infos, video_only=True):
             try:
                 copy_merge(folder, files, infos, job, duration)
                 job.update(status='done',message='動画が完成しました（元画質・高速結合）',percent=100)
                 return
             except (ValueError, subprocess.TimeoutExpired):
+                app.logger.exception('Fast merge failed; falling back to video encoding')
+                reason = '高速結合の検証に通らなかったため'
                 for temporary in folder.glob('fast*'): temporary.unlink(missing_ok=True)
                 (folder/'result.mp4').unlink(missing_ok=True)
                 job['percent']=0
@@ -232,12 +271,12 @@ def render(key, files, aspect):
         w,h = {'vertical':(720,1280),'horizontal':(1280,720),'square':(720,720)}[aspect]
         completed = 0
         for i,(source,info) in enumerate(zip(files,infos)):
-            job['message'] = f'{i+1}/{len(files)}本目を変換中'
+            job['message'] = f'{i+1}/{len(files)}本目を変換中（{reason}）'
             audio = any(s['codec_type']=='audio' for s in info['streams'])
             d = float(info['format']['duration'])
             cmd = ['ffmpeg','-hide_banner','-loglevel','error','-y','-threads','1','-filter_threads','1','-i',str(source)]
             if not audio: cmd += ['-f','lavfi','-i','anullsrc=r=48000:cl=stereo']
-            vf = f'scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p'
+            vf = f'scale={w}:{h}:flags=fast_bilinear:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p'
             if style=='stylish':
                 fade = min(.35,d/2)
                 vf += f',fade=t=in:st=0:d={fade},fade=t=out:st={d-fade}:d={fade}'
@@ -254,7 +293,7 @@ def render(key, files, aspect):
         run(['ffmpeg','-hide_banner','-loglevel','error','-y','-f','concat','-safe','1','-i',str(listing),'-c','copy','-movflags','+faststart',str(folder/'result.mp4')])
         job.update(status='done',message='動画が完成しました',percent=100)
     except subprocess.TimeoutExpired:
-        job.update(status='error',message='処理時間を超えました。短い動画で試してください。')
+        job.update(status='error',message='サーバーの処理時間上限に達しました。動画の長さだけが原因とは限りません。')
     except Exception as e:
         job.update(status='error',message=str(e) if isinstance(e,ValueError) else '処理に失敗しました。もう一度試してください。')
     finally:
@@ -377,13 +416,13 @@ HTML = '''<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewp
 <div class="card"><div class="step">STEP 1</div><h3>動画を選ぶ</h3><label class="upload" for="files">＋ 動画を選択</label><input id="files" type="file" accept="video/*" multiple><p class="note">1〜5本・合計2GB／10分以内。矢印で順番を変えられます。</p><p id="size" class="note" aria-live="polite"></p><div id="list"></div></div>
 <div class="card"><div class="step">STEP 2</div><h3>投稿するSNS</h3><select id="sns"><option value="original">指定なし（元の画角）</option><option value="tiktok">TikTok</option><option value="instagram">Instagram Reels</option><option value="shorts">YouTube Shorts</option><option value="x">X</option><option value="youtube">YouTube</option></select></div>
 <div class="card"><div class="step">STEP 3</div><h3>ジャンルと編集方針</h3><select id="genre"><option>お笑い・コメディ</option><option>グルメ・料理</option><option>Vlog</option><option>ゲーム</option><option>配信・切り抜き</option><option>音楽</option><option>美容・ファッション</option><option>旅行</option><option>ビジネス</option><option>商品紹介</option></select><select id="style"><option value="full">全編を残す（高速結合優先）</option><option value="reach">再生数・伸び重視</option><option value="tempo">テンポ重視</option><option value="stylish">おしゃれ重視</option><option value="pro">プロっぽく</option><option disabled>AIにおまかせ（準備中）</option></select><p id="policy" class="note"></p><textarea id="prompt" maxlength="1000" placeholder="追加指示をメモ（保存のみ。自動編集にはまだ反映されません）" style="box-sizing:border-box;width:100%;min-height:85px;padding:14px"></textarea><p class="note">現在は固定ルールによる編集です。AIによる見どころ判断・字幕・BGM・再生数の最適化は未対応です。</p></div>
-<div class="card"><div class="step">STEP 4</div><label for="title">編集名（任意）</label><input id="title" maxlength="80" placeholder="例：挙式・披露宴・二次会" style="box-sizing:border-box;width:100%;padding:14px;margin-bottom:16px"><h3>完成動画の画角</h3><select id="aspect"><option value="auto">投稿するSNSに合わせる</option><option value="original">元の画角（形式が揃えば高速結合）</option><option value="vertical">縦 9:16（TikTok・Reels・Shorts）</option><option value="horizontal">横 16:9（YouTube・式の記録）</option><option value="square">正方形 1:1</option></select><p class="note">人物が切れないよう、余白を付けて画角を揃えます。元の音声は残します。「全編を残す」で元の画角・形式が揃う場合は元画質で高速結合します。画角変更や編集効果を使う場合は720p相当に変換します。</p><button id="go" disabled>この編集を制作リストに追加</button><p class="note">制作依頼は最大5件。変換中も次の編集を追加できます。変換は受付順に進みます。</p><p class="note">この版では動画の結合と保存ができます。AIによる見どころ選択・自動字幕・BGM追加はまだ入っていません。</p></div>
+<div class="card"><div class="step">STEP 4</div><label for="title">編集名（任意）</label><input id="title" maxlength="80" placeholder="例：挙式・披露宴・二次会" style="box-sizing:border-box;width:100%;padding:14px;margin-bottom:16px"><h3>完成動画の画角</h3><select id="aspect"><option value="auto">投稿するSNSに合わせる</option><option value="original">元の画角（形式が揃えば高速結合）</option><option value="vertical">縦 9:16（TikTok・Reels・Shorts）</option><option value="horizontal">横 16:9（YouTube・式の記録）</option><option value="square">正方形 1:1</option></select><p class="note">人物が切れないよう、余白を付けて画角を揃えます。元の音声は残します。「全編を残す」で映像形式と指定した画角が揃えば、SNSを選んでも元画質で高速結合します。音声だけが異なる場合は音声を揃えます。画角変更や編集効果が必要な場合は720p相当に変換します。</p><button id="go" disabled>この編集を制作リストに追加</button><p class="note">制作依頼は最大5件。変換中も次の編集を追加できます。変換は受付順に進みます。</p><p class="note">この版では動画の結合と保存ができます。AIによる見どころ選択・自動字幕・BGM追加はまだ入っていません。</p></div>
 <div id="out" class="card hidden" aria-live="polite"><h3 id="message"></h3><progress id="progress"></progress><video id="preview" class="hidden" controls playsinline></video><a id="save" class="save hidden">MP4を保存</a><p id="hint" class="note"></p></div><h2>制作リスト</h2><p id="jobsNotice" class="note">読み込み中…</p><div id="jobs"></div></div>
 <script>
 let selected=[],busy=false;const $=id=>document.getElementById(id);function draw(){const total=selected.reduce((n,f)=>n+f.size,0);$('size').textContent=selected.length?selected.length+'本・合計 '+(total/(1024*1024)).toFixed(1)+' MB（上限 2GB）':''; $('list').replaceChildren();selected.forEach((f,i)=>{const row=document.createElement('div');row.className='file';const name=document.createElement('span');name.textContent=(i+1)+'．'+f.name;row.append(name);for(const [label,delta] of [['↑',-1],['↓',1]]){const b=document.createElement('button');b.textContent=label;b.setAttribute('aria-label',f.name+'を'+(delta<0?'前':'後')+'へ');b.disabled=busy||i+delta<0||i+delta>=selected.length;b.onclick=()=>{[selected[i],selected[i+delta]]=[selected[i+delta],selected[i]];draw()};row.append(b)}$('list').append(row)});$('go').disabled=busy||!selected.length;$('files').disabled=busy;$('aspect').disabled=busy;for(const id of ['sns','genre','style','prompt','title'])$(id).disabled=busy}
 function policy(){
  const caps={'お笑い・コメディ':12,'グルメ・料理':8,'Vlog':8,'ゲーム':12,'配信・切り抜き':15,'音楽':20,'美容・ファッション':8,'旅行':8,'ビジネス':15,'商品紹介':10};
- const descriptions={full:'素材を全編残します。形式と画角が揃えば元画質で高速結合します。',reach:'各素材の冒頭15秒までを使います。見どころの自動判断は行いません。',tempo:'このジャンルは各素材の冒頭'+caps[$('genre').value]+'秒までを使います。',stylish:'各素材の映像の最初と最後に0.35秒のフェードを付けます。',pro:'720p相当で、通常より画質を優先して変換します。'};
+ const descriptions={full:'素材を全編残します。映像形式と指定した画角が揃えば元画質で高速結合します。',reach:'各素材の冒頭15秒までを使います。見どころの自動判断は行いません。',tempo:'このジャンルは各素材の冒頭'+caps[$('genre').value]+'秒までを使います。',stylish:'各素材の映像の最初と最後に0.35秒のフェードを付けます。',pro:'720p相当で、通常より画質を優先して変換します。'};
  $('policy').textContent=descriptions[$('style').value];
 }
 $('genre').onchange=policy;$('style').onchange=policy;policy();
@@ -405,6 +444,22 @@ function showOutput(){
  $('progress').classList.remove('hidden');$('progress').removeAttribute('value');
  $('out').scrollIntoView({behavior:'smooth'});
 }
+function updateEstimate(card,job,now){
+ // Repeated polls at the same progress must not extend the completion time.
+ if(job.percent>=99){card.target=null;return;}
+ if(card.lastPercent===undefined||card.lastPercent===null||job.percent<card.lastPercent){
+  card.target=null;card.lastPercent=job.percent;card.lastEstimate=0;
+ }
+ if(job.percent<5||job.elapsed<30)return;
+ const advanced=job.percent>card.lastPercent;
+ if(card.target===null||card.target===undefined){
+  card.target=now+job.elapsed*(100-job.percent)/job.percent*1000;card.lastEstimate=now;card.lastPercent=job.percent;return;
+ }
+ if(advanced&&now-card.lastEstimate>=15000){
+  const measured=now+job.elapsed*(100-job.percent)/job.percent*1000;
+  card.target+=.15*(measured-card.target);card.lastEstimate=now;card.lastPercent=job.percent;
+ }
+}
 const cards=new Map();let latestJobs=[];
 function updateJobs(jobs){
  latestJobs=jobs;const active=jobs.filter(j=>['queued','processing'].includes(j.status)).length;
@@ -420,10 +475,10 @@ function updateJobs(jobs){
   card.title.textContent=job.title;card.settings.textContent=job.settings+(job.prompt?' ／ メモ：'+job.prompt:'');card.message.textContent=job.status==='queued'?'順番待ち '+job.queue_position+'件目':job.message;
   card.bar.max=100;card.bar.value=job.percent;card.bar.hidden=job.status!=='processing';
   if(job.status==='processing'){
-   card.target=job.percent>0&&job.percent<99&&job.elapsed>=10?Date.now()+job.elapsed*(100-job.percent)/job.percent*1000:null;
-   card.hint.textContent=job.percent>=99?'MP4を仕上げています':job.percent+'%・残り時間を計算中';
+   updateEstimate(card,job,Date.now());
+   card.hint.textContent=job.percent>=99?'MP4を仕上げています':Math.floor(job.percent)+'%・残り時間を計算中';
   }else{
-   card.target=null;card.hint.textContent=job.status==='queued'?job.settings+'。先の編集が完成すると自動で始まります。':job.status==='done'?'完成後約1時間保存できます。サーバー再起動時は消えます。':'この編集をもう一度追加してください。';
+   card.target=null;card.lastPercent=null;card.hint.textContent=job.status==='queued'?job.settings+'。先の編集が完成すると自動で始まります。':job.status==='done'?'完成後約1時間保存できます。サーバー再起動時は消えます。':'この編集をもう一度追加してください。';
   }
   if(job.status==='done'&&!card.video.getAttribute('src')){
    const url='/api/jobs/'+job.id+'/video?token='+encodeURIComponent(job.token);
@@ -433,7 +488,7 @@ function updateJobs(jobs){
  }
  for(const [id,card] of cards){if(!jobs.some(j=>j.id===id)){card.el.remove();cards.delete(id);}}
 }
-setInterval(()=>{for(const card of cards.values()){if(card.target!==null&&card.target!==undefined)card.hint.textContent='完了まで約 '+remainingText(Math.max(1,Math.ceil((card.target-Date.now())/1000)))+'（目安）';}},1000);
+setInterval(()=>{for(const card of cards.values()){if(card.target!==null&&card.target!==undefined)card.hint.textContent=(card.target>Date.now()?'完了まで約 '+remainingText(Math.ceil((card.target-Date.now())/1000))+'（目安）':'推定を更新中。処理は継続しています');}},1000);
 async function refreshJobs(){
  const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),15000);
  let response;try{response=await fetch('/api/jobs/list',{signal:controller.signal});}finally{clearTimeout(timeout);}
