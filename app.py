@@ -2,10 +2,10 @@ import os, json, secrets, shutil, subprocess, tempfile, threading, time, uuid, s
 import urllib.request, urllib.error
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from flask import Flask, request, jsonify, send_file, session, redirect, render_template_string
+from flask import Flask, Request, request, jsonify, send_file, session, redirect, render_template_string
 from datetime import timedelta
 from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.exceptions import HTTPException
+from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 
 app = Flask(__name__)
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
@@ -81,6 +81,104 @@ BUSY = threading.BoundedSemaphore(MAX_ACTIVE_JOBS)
 WORK_QUEUE = queue.Queue()
 WORKER_LOCK = threading.Lock()
 WORKER_STARTED = False
+UPLOAD_STAGING = ROOT/'receiving'
+UPLOAD_STAGING.mkdir()
+
+ASSETS = {}
+ASSET_LOCK = threading.Lock()
+UPLOAD_LOCK = threading.Lock()
+ASSET_ROOT = ROOT/'sources'
+ASSET_ROOT.mkdir()
+
+def expire_assets():
+    now=time.time()
+    for key,item in list(ASSETS.items()):
+        if now-item['used']>3600:
+            item['path'].unlink(missing_ok=True)
+            del ASSETS[key]
+
+@app.get('/api/assets')
+def list_assets():
+    with ASSET_LOCK:
+        expire_assets()
+        return jsonify(assets=[{'id':key,'name':item['name'],'size':item['size']} for key,item in ASSETS.items()])
+
+@app.get('/api/assets/<key>/video')
+def asset_video(key):
+    with ASSET_LOCK:
+        expire_assets()
+        item=ASSETS.get(key)
+        if not item: return jsonify(error='保存済み素材の期限が切れました。'),404
+        item['used']=time.time()
+        return send_file(item['path'],mimetype='video/mp4',conditional=True)
+
+@app.post('/api/assets')
+def upload_asset():
+    if not UPLOAD_LOCK.acquire(blocking=False): return jsonify(error='別の動画を送信中です。完了後に追加してください。'),429
+    key=uuid.uuid4().hex
+    path=ASSET_ROOT/key
+    try:
+        size=0
+        with ASSET_LOCK:
+            expire_assets()
+            cached=sum(item['size'] for item in ASSETS.values())
+        with path.open('wb') as target:
+            while True:
+                chunk=request.stream.read(1024*1024)
+                if not chunk: break
+                size+=len(chunk)
+                if size>MAX_UPLOAD_BYTES: raise RequestEntityTooLarge()
+                if cached+size>MAX_UPLOAD_BYTES*2: raise ValueError('保存済み素材が4GBに達しました。約1時間後に再試行してください。')
+                if shutil.disk_usage(ASSET_ROOT).free<len(chunk)+512*1024*1024: raise ValueError('サーバーの空き容量が不足しています。')
+                target.write(chunk)
+        if not size: raise ValueError('空の動画は使えません。')
+        name=urllib.parse.unquote(request.headers.get('X-Video-Name','動画'))[:200]
+        with ASSET_LOCK: ASSETS[key]={'path':path,'name':name,'size':size,'used':time.time()}
+        return jsonify(id=key,name=name,size=size),201
+    except Exception as error:
+        path.unlink(missing_ok=True)
+        if isinstance(error,HTTPException): raise
+        return jsonify(error=str(error) if isinstance(error,ValueError) else '動画の受信に失敗しました。'),400
+    finally: UPLOAD_LOCK.release()
+
+class DirectUploadStream:
+    """Receive once onto the same filesystem as the rendering job."""
+    def __init__(self, owner):
+        self.owner=owner
+        self.target=tempfile.NamedTemporaryFile(mode='w+b',dir=UPLOAD_STAGING,delete=False)
+        self.name=self.target.name
+        self.size=0
+        self.last_disk_check=0
+    def write(self, chunk):
+        received=getattr(self.owner,'video_upload_bytes',0)+len(chunk)
+        if received>MAX_UPLOAD_BYTES: raise RequestEntityTooLarge()
+        if self.size==0 or self.size-self.last_disk_check>=16*1024*1024:
+            if shutil.disk_usage(UPLOAD_STAGING).free<len(chunk)+512*1024*1024:
+                raise ValueError('サーバーの空き容量が不足しています。少ない本数で試してください。')
+            self.last_disk_check=self.size
+        written=self.target.write(chunk)
+        self.size+=written
+        self.owner.video_upload_bytes=received
+        return written
+    def __getattr__(self, name): return getattr(self.target,name)
+
+class VideoRequest(Request):
+    def _get_file_stream(self, total_content_length, content_type, filename=None, content_length=None):
+        if self.path!='/api/jobs':
+            return super()._get_file_stream(total_content_length,content_type,filename,content_length)
+        streams=self.__dict__.setdefault('video_upload_streams',[])
+        if len(streams)>=5: raise ValueError('動画は1〜5本選んでください。')
+        stream=DirectUploadStream(self)
+        streams.append(stream)
+        return stream
+
+app.request_class=VideoRequest
+
+@app.teardown_request
+def cleanup_unclaimed_uploads(error):
+    for stream in request.__dict__.get('video_upload_streams',[]):
+        stream.close()
+        Path(stream.name).unlink(missing_ok=True)
 
 def start_worker():
     global WORKER_STARTED
@@ -392,7 +490,7 @@ def render(key, files, aspect):
     job = JOBS[key]
     folder = ROOT/key
     diagnostic=job.setdefault('diagnostics',{})
-    diagnostic.update(version='16',resources=cpu_resources(),requested_aspect=aspect,
+    diagnostic.update(version='18',resources=cpu_resources(),requested_aspect=aspect,
                       requested_ranges=job.get('ranges',[]),sns=job.get('sns'),genre=job.get('genre'),style=job.get('style'))
     try:
         checking=time.monotonic()
@@ -516,17 +614,25 @@ def create():
     key=uuid.uuid4().hex
     folder=ROOT/key
     try:
-        incoming = request.files.getlist('videos')
-        aspect = request.form.get('aspect','original')
-        sns = request.form.get('sns','original')
-        genre = request.form.get('genre',GENRES[0])
-        style = request.form.get('style','full')
+        receiving=time.monotonic()
+        settings=request.get_json() if request.is_json else request.form
+        if not isinstance(settings,dict) and request.is_json: raise ValueError('編集設定を確認してください。')
+        asset_ids=settings.get('assets') if request.is_json else None
+        if request.is_json and (not isinstance(asset_ids,list) or not 1<=len(asset_ids)<=5 or any(not isinstance(k,str) for k in asset_ids)): raise ValueError('動画は1〜5本選んでください。')
+        incoming = asset_ids if request.is_json else request.files.getlist('videos')
+        receive_seconds=time.monotonic()-receiving
+        preparing=time.monotonic()
+        aspect = settings.get('aspect','original')
+        sns = settings.get('sns','original')
+        genre = settings.get('genre',GENRES[0])
+        style = settings.get('style','full')
         if sns not in SNS or genre not in GENRES or style not in STYLES: raise ValueError('編集設定を選び直してください。')
         if aspect=='auto': aspect = 'vertical' if sns in ('tiktok','instagram','shorts') else 'horizontal' if sns in ('youtube','x') else 'original'
         if not 1<=len(incoming)<=5 or aspect not in ('original','vertical','horizontal','square'):
             raise ValueError('動画は1〜5本選んでください。')
         try:
-            ranges=validate_ranges(json.loads(request.form.get('ranges',json.dumps([[] for _ in incoming]))),len(incoming))
+            raw_ranges=settings.get('ranges',[[] for _ in incoming] if request.is_json else json.dumps([[] for _ in incoming]))
+            ranges=validate_ranges(raw_ranges if request.is_json else json.loads(raw_ranges),len(incoming))
         except (json.JSONDecodeError,TypeError):
             raise ValueError('区間指定を読み取れませんでした。') from None
         if style in ('reach','tempo') and not any(ranges):
@@ -536,26 +642,41 @@ def create():
         folder.mkdir()
         paths=[]
         total=0
-        for i,file in enumerate(incoming):
-            path=folder/f'input{i}'
-            with path.open('wb') as target:
-                while True:
-                    chunk = file.stream.read(1024 * 1024)
-                    if not chunk: break
-                    total += len(chunk)
-                    if total > MAX_UPLOAD_BYTES:
-                        raise ValueError('動画の合計サイズを2GB以内にしてください。')
-                    if shutil.disk_usage(folder).free < len(chunk) + 512 * 1024 * 1024:
-                        raise ValueError('サーバーの空き容量が不足しています。少ない本数で試してください。')
-                    target.write(chunk)
-            paths.append(path)
+        source_title='動画'
+        if request.is_json:
+            with ASSET_LOCK:
+                expire_assets()
+                for i,asset_id in enumerate(asset_ids):
+                    item=ASSETS.get(asset_id)
+                    if not item: raise ValueError('素材の保存期限が切れました。動画を選び直してください。')
+                    total+=item['size']
+                    if total>MAX_UPLOAD_BYTES: raise ValueError('動画の合計サイズを2GB以内にしてください。')
+                    path=folder/f'input{i}'
+                    os.link(item['path'],path)
+                    paths.append(path)
+                    item['used']=time.time()
+                    if i==0: source_title=item['name']
+        else:
+            for i,file in enumerate(incoming):
+                path=folder/f'input{i}'
+                if not isinstance(file.stream,DirectUploadStream):
+                    raise ValueError('動画の受信方式を確認できませんでした。ページを開き直してください。')
+                total+=file.stream.size
+                if total>MAX_UPLOAD_BYTES: raise ValueError('動画の合計サイズを2GB以内にしてください。')
+                file.stream.close()
+                os.replace(file.stream.name,path)
+                paths.append(path)
+            source_title=incoming[0].filename or '動画'
         if total>MAX_UPLOAD_BYTES or any(p.stat().st_size==0 for p in paths):
             raise ValueError('空の動画は使えません。合計サイズは2GB以内にしてください。')
         token=secrets.token_urlsafe(32)
         with LOCK:
             JOBS[key]={'token':token,'status':'queued','message':'順番待ち','created':time.time(),'percent':0,
-                       'sns':sns,'genre':genre,'style':style,'ranges':ranges,'prompt':request.form.get('prompt','')[:1000],
-                       'title':request.form.get('title','').strip()[:80] or incoming[0].filename[:80]}
+                       'sns':sns,'genre':genre,'style':style,'ranges':ranges,'prompt':settings.get('prompt','')[:1000],
+                       'title':settings.get('title','').strip()[:80] or source_title[:80],
+                       'diagnostics':{'upload':{'storage':'cached-hardlinks' if request.is_json else 'direct-file-rename','bytes':total,
+                           'receive_and_parse_seconds':round(receive_seconds,3),
+                           'prepare_seconds':round(time.monotonic()-preparing,3)}}}
         start_worker()
         WORK_QUEUE.put((key,paths,aspect))
         return jsonify(id=key,token=token),202
@@ -624,13 +745,13 @@ def diagnostics(key):
 HTML = r'''<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>動画編集アプリ</title>
 <style>body{margin:0;background:#0b0d12;color:#fff;font-family:-apple-system,sans-serif}.w{max-width:720px;margin:auto;padding:24px 16px 60px}.card{background:#171b25;border:1px solid #303747;border-radius:18px;padding:18px;margin:16px 0}h1{font-size:28px}.sub,.note{color:#aeb6c7;line-height:1.6}.step{color:#a994ff;font-weight:bold}.upload,button,.save{display:block;border-radius:12px;padding:18px;text-align:center}input[type=file]{position:absolute;width:1px;height:1px;opacity:0}.upload{border:2px dashed #59637b;cursor:pointer}.file{display:flex;gap:8px;align-items:center;background:#10141c;margin-top:8px;padding:10px;border-radius:10px}.file span{flex:1;overflow-wrap:anywhere}.file button{width:auto;padding:8px;margin:0;background:#303747}select,button{width:100%;box-sizing:border-box;font-size:16px;color:white}select{background:#0f131b;border:1px solid #343c4d;padding:14px;border-radius:12px}button,.save{border:0;background:#7d5cff;color:#fff;font-weight:bold;margin-top:16px;text-decoration:none}button:disabled{opacity:.45}.note{font-size:13px}video{width:100%;max-height:520px;margin-top:16px}.hidden{display:none}.trim-editor{margin-top:14px;padding:12px;border:1px solid #343b4c;border-radius:12px}.trim-editor input[type=range]{display:block;width:100%;height:30px;margin:12px 0;accent-color:#9b82ff;border-radius:10px;touch-action:pan-y}.trim-actions,.trim-saved{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}.trim-actions button,.trim-saved button{width:auto;padding:12px;font-size:14px}.trim-saved span{flex-basis:100%}label{display:block;margin:12px 0}progress{width:100%}</style>
 <div class="w"><form method="post" action="/logout"><input type="hidden" name="csrf" value="__CSRF__"><button>ログアウト</button></form><h1>藤原専用・動画編集アプリ</h1><p class="sub">複数の動画を1本のMP4に。SNS・ジャンル・編集方針を選んで作成できます。</p>
-<div class="card"><div class="step">STEP 1</div><h3>動画を選ぶ</h3><label class="upload" for="files">＋ 動画を選択</label><input id="files" type="file" accept="video/*" multiple><label class="upload" for="originalFiles" style="margin-top:12px">＋ 保存済みの動画ファイルを選択</label><input id="originalFiles" type="file" accept=".mov,.mp4,.m4v,.webm,.mkv,.avi" multiple><p class="note">写真からの読み込みが遅い場合は、保存済みの元動画を選べます。選択メニューでは「ファイルを選択」を選んでください。</p><details class="note"><summary>元動画をファイルに保存するには</summary><p>写真アプリで動画を選択 → 共有 →「未編集のオリジナルを書き出す」→「このiPhone内」に保存します。表示されない場合は「ファイルに保存」も使えますが、書き出し時に変換される場合があります。iCloud上の動画はダウンロード時間が必要です。</p></details><p class="note">1〜5本・合計2GB／10分以内。矢印で順番を変えられます。</p><p id="size" class="note" aria-live="polite"></p><div id="list"></div></div>
+<div class="card"><div class="step">STEP 1</div><h3>動画を選ぶ</h3><label class="upload" for="files">＋ 動画を選択</label><input id="files" type="file" accept="video/*" multiple><label class="upload" for="originalFiles" style="margin-top:12px">＋ 保存済みの動画ファイルを選択</label><input id="originalFiles" type="file" accept=".mov,.mp4,.m4v,.webm,.mkv,.avi" multiple><p class="note">写真からの読み込みが遅い場合は、保存済みの元動画を選べます。選択メニューでは「ファイルを選択」を選んでください。</p><details class="note"><summary>元動画をファイルに保存するには</summary><p>写真アプリで動画を選択 → 共有 →「未編集のオリジナルを書き出す」→「このiPhone内」に保存します。表示されない場合は「ファイルに保存」も使えますが、書き出し時に変換される場合があります。iCloud上の動画はダウンロード時間が必要です。</p></details><p class="note">1〜5本・合計2GB／10分以内。矢印で順番を変えられます。</p><p id="size" class="note" aria-live="polite"></p><details><summary>送信済み動画を再利用する（約1時間・サーバー再起動で消去）</summary><div id="assetList"></div></details><div id="list"></div></div>
 <div class="card"><div class="step">STEP 2</div><h3>投稿するSNS</h3><select id="sns"><option value="original">指定なし（元の画角）</option><option value="tiktok">TikTok</option><option value="instagram">Instagram Reels</option><option value="shorts">YouTube Shorts</option><option value="x">X</option><option value="youtube">YouTube</option></select></div>
 <div class="card"><div class="step">STEP 3</div><h3>ジャンルと編集方針</h3><select id="genre"><option>お笑い・コメディ</option><option>グルメ・料理</option><option>Vlog</option><option>ゲーム</option><option>配信・切り抜き</option><option>音楽</option><option>美容・ファッション</option><option>旅行</option><option>ビジネス</option><option>商品紹介</option></select><select id="style"><option value="full">全編または指定区間を残す</option><option value="reach">短くまとめる（区間指定）</option><option value="tempo">テンポ重視（区間指定）</option><option value="stylish">おしゃれ重視</option><option value="pro">プロっぽく</option><option value="ai" __AI_DISABLED__>AIで見どころを選ぶ（音声解析・__AI_STATE__）</option></select><p id="policy" class="note"></p><p id="aiDisclosure" class="note hidden">AI解析では音声・文字起こし・追加指示をOpenAIへ送信します。API利用料金が発生します。AIの選択結果は完成動画で確認してください。</p><textarea id="prompt" maxlength="1000" placeholder="AIへの追加指示（AI解析時に使用。その他の編集ではメモとして保存）" style="box-sizing:border-box;width:100%;min-height:85px;padding:14px"></textarea><p class="note">指定区間は冒頭・途中・後半のどこでも使えます。AI解析では動画全体の会話から場面を選び、指定区間も必ず残します。映像そのものの意味判断・自動字幕・BGM追加・再生数の保証には未対応です。</p></div>
 <div class="card"><div class="step">STEP 4</div><label for="title">編集名（任意）</label><input id="title" maxlength="80" placeholder="例：挙式・披露宴・二次会" style="box-sizing:border-box;width:100%;padding:14px;margin-bottom:16px"><h3>完成動画の画角</h3><select id="aspect"><option value="auto">投稿するSNSに合わせる</option><option value="original">元の画角（形式が揃えば高速結合）</option><option value="vertical">縦 9:16（TikTok・Reels・Shorts）</option><option value="horizontal">横 16:9（YouTube・式の記録）</option><option value="square">正方形 1:1</option></select><p class="note">人物が切れないよう、余白を付けて画角を揃えます。元の音声は残します。区間指定なしで映像形式と指定した画角が揃えば、SNSを選んでも元画質で高速結合します。音声だけが異なる場合は音声を揃えます。画角変更や編集効果が必要な場合は720p相当に変換します。</p><button id="go" disabled>この編集を制作リストに追加</button><p class="note">制作依頼は最大5件。変換中も次の編集を追加できます。変換は受付順に進みます。</p><p class="note">区間指定・結合・保存に対応しています。AIの音声解析には接続設定が必要です。自動字幕・BGM追加は未対応です。</p></div>
 <div id="out" class="card hidden" aria-live="polite"><h3 id="message"></h3><progress id="progress"></progress><video id="preview" class="hidden" controls playsinline></video><a id="save" class="save hidden">MP4を保存</a><p id="hint" class="note"></p></div><h2>制作リスト</h2><p id="jobsNotice" class="note">読み込み中…</p><div id="jobs"></div></div>
 <script>
-let selected=[],busy=false;const rangeNotes=new WeakMap();let previewURLs=[];const $=id=>document.getElementById(id);
+let selected=[],busy=false;const uploadedSources=new WeakMap(),assetObjects=new Map();const rangeNotes=new WeakMap();let previewURLs=[];const $=id=>document.getElementById(id);
 const trimDrafts=new WeakMap();let previewPlayers=[];
 function clipTime(seconds){const value=Math.max(0,seconds);return Math.floor(value/60)+':'+(value%60).toFixed(2).padStart(5,'0');}
 function mountTrimmer(file,box,input){
@@ -700,7 +821,7 @@ function mountTrimmer(file,box,input){
   editor.append(player,message,seek);
   for(const [text,slider] of [['開始位置を動かす',start],['終了位置を動かす',end]]){const label=document.createElement('label');label.textContent=text;editor.append(label,slider);}
   editor.append(selection,actions);box.append(editor);
-  const url=URL.createObjectURL(file);previewURLs.push(url);player.src=url;
+  const url=file._asset?'/api/assets/'+file._asset+'/video':URL.createObjectURL(file);if(!file._asset)previewURLs.push(url);player.src=url;
  };
  box.append(note,preview,saved);renderSaved();
 }
@@ -812,7 +933,7 @@ async function pollJobs(){
  try{await refreshJobs();}catch(error){$('jobsNotice').textContent=error.message+' 通信が戻ると再確認します。';}
  setTimeout(pollJobs,2000);
 }
-function sendVideos(body){return new Promise((resolve,reject)=>{
+function sendVideos(body,url='/api/jobs',name=''){return new Promise((resolve,reject)=>{
  const uploadStarted=Date.now();let loaded=0,total=0,lastProgress=uploadStarted,waitingSince=null,settled=false;
  clearRemaining();
  const mb=bytes=>(bytes/1024/1024).toFixed(1)+' MB';
@@ -826,7 +947,7 @@ function sendVideos(body){return new Promise((resolve,reject)=>{
  }
  const timer=setInterval(display,1000);
  function finish(error,data){if(settled)return;settled=true;clearInterval(timer);if(error)reject(error);else resolve(data);}
- const xhr=new XMLHttpRequest();xhr.open('POST','/api/jobs');xhr.setRequestHeader('X-CSRF-Token','__CSRF__');
+ const xhr=new XMLHttpRequest();xhr.open('POST',url);if(name){xhr.setRequestHeader('Content-Type','application/octet-stream');xhr.setRequestHeader('X-Video-Name',encodeURIComponent(name));}xhr.setRequestHeader('X-CSRF-Token','__CSRF__');
  xhr.timeout=30*60*1000;
  xhr.upload.onprogress=event=>{
   loaded=event.loaded;lastProgress=Date.now();
@@ -843,7 +964,7 @@ function sendVideos(body){return new Promise((resolve,reject)=>{
 async function task(work){
  busy=true;draw();showOutput();
  try{await work();}catch(e){$('message').textContent=e.message;$('hint').textContent='再送信する前に、ページを開き直すと前の処理状況を確認できます。';}
- finally{clearRemaining();busy=false;$('progress').classList.add('hidden');draw();}
+ finally{clearRemaining();busy=false;refreshAssets();$('progress').classList.add('hidden');draw();}
 }
 $('go').onclick=()=>task(async()=>{
  await refreshJobs();
@@ -852,12 +973,24 @@ $('go').onclick=()=>task(async()=>{
  if(!selected.length||selected.length>5||total>2*1024*1024*1024)throw Error('素材は1〜5本、合計2GB以内で選んでください。');
  const ranges=selected.map(f=>parseRanges(rangeNotes.get(f)||''));
  if(['tempo','reach'].includes($('style').value)&&!ranges.some(r=>r.length))throw Error('短く編集する場合は、動画ごとの「必ず残す区間」を指定してください。');
- const body=new FormData();body.append('ranges',JSON.stringify(ranges));selected.forEach(f=>body.append('videos',f));body.append('aspect',$('aspect').value);body.append('title',$('title').value);for(const id of ['sns','genre','style','prompt'])body.append(id,$(id).value);
- $('message').textContent='動画を送信しています 0%';$('hint').textContent='送信が終わるまでSafariを開いたままお待ちください。';
- await sendVideos(body);selected=[];$('files').value='';$('originalFiles').value='';$('title').value='';
+ const payload={ranges,assets:[],aspect:$('aspect').value,title:$('title').value};for(const id of ['sns','genre','style','prompt'])payload[id]=$(id).value;
+ const available=await fetch('/api/assets').then(r=>r.json());const live=new Set((available.assets||[]).map(a=>a.id));
+ for(const file of selected){
+  let id=file._asset||uploadedSources.get(file);
+  if(id&&!live.has(id)){if(file._asset)throw Error('保存済み素材の期限が切れました。動画を選び直してください。');id=null;}
+  if(!id){$('message').textContent='動画を送信しています';const asset=await sendVideos(file,'/api/assets',file.name);id=asset.id;uploadedSources.set(file,id);live.add(id);}
+  payload.assets.push(id);
+ }
+ const response=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':'__CSRF__'},body:JSON.stringify(payload)});const result=await response.json();if(!response.ok)throw Error(result.error||'編集の受付に失敗しました。');
+ selected=[];$('files').value='';$('originalFiles').value='';$('title').value='';
  clearRemaining();$('message').textContent='制作リストに追加しました';$('hint').textContent='次の編集の動画を選んで追加できます。';
  await refreshJobs().catch(()=>{$('jobsNotice').textContent='受付済み。制作リストは通信が戻ると更新します。再送信は不要です。';});
 });
-draw();pollJobs();
+async function refreshAssets(){
+ try{const response=await fetch('/api/assets');if(!response.ok)return;const data=await response.json();$('assetList').replaceChildren();
+ for(const item of data.assets){let file=assetObjects.get(item.id);if(!file){file={name:item.name,size:item.size,_asset:item.id};assetObjects.set(item.id,file);}const button=document.createElement('button');button.textContent=item.name+' を追加';button.disabled=busy;button.onclick=()=>{if(busy)return;if(selected.length>=5){alert('動画は5本までです。');return;}selected.push(file);draw();};$('assetList').append(button);}
+ }catch(e){}
+}
+draw();pollJobs();refreshAssets();
 </script></html>'''
 if __name__=='__main__': app.run(host='0.0.0.0',port=int(os.environ.get('PORT',10000)))
