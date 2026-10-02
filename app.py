@@ -5,7 +5,8 @@ from datetime import timedelta
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 210 * 1024 * 1024
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_BYTES + 10 * 1024 * 1024
 app.secret_key = os.environ.get('SESSION_SECRET') or secrets.token_hex(32)
 app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_HTTPONLY=True,
                   SESSION_COOKIE_SAMESITE='Strict', PERMANENT_SESSION_LIFETIME=timedelta(hours=12))
@@ -149,7 +150,7 @@ def index():
 def health(): return {'status':'ok'}
 
 @app.errorhandler(413)
-def too_large(e): return jsonify(error='動画の合計サイズを200MB以内にしてください。'),413
+def too_large(e): return jsonify(error='動画の合計サイズを2GB以内にしてください。'),413
 
 @app.post('/api/jobs')
 def create():
@@ -168,11 +169,19 @@ def create():
         total=0
         for i,file in enumerate(incoming):
             path=folder/f'input{i}'
-            file.save(path)
-            total += path.stat().st_size
+            with path.open('wb') as target:
+                while True:
+                    chunk = file.stream.read(1024 * 1024)
+                    if not chunk: break
+                    total += len(chunk)
+                    if total > MAX_UPLOAD_BYTES:
+                        raise ValueError('動画の合計サイズを2GB以内にしてください。')
+                    if shutil.disk_usage(folder).free < len(chunk) + 512 * 1024 * 1024:
+                        raise ValueError('サーバーの空き容量が不足しています。少ない本数で試してください。')
+                    target.write(chunk)
             paths.append(path)
-        if total>200*1024*1024 or any(p.stat().st_size==0 for p in paths):
-            raise ValueError('空の動画は使えません。合計サイズは200MB以内にしてください。')
+        if total>MAX_UPLOAD_BYTES or any(p.stat().st_size==0 for p in paths):
+            raise ValueError('空の動画は使えません。合計サイズは2GB以内にしてください。')
         token=secrets.token_urlsafe(32)
         JOBS[key]={'token':token,'status':'processing','message':'動画を確認しています','created':time.time()}
         threading.Thread(target=render,args=(key,paths,aspect),daemon=True).start()
@@ -203,12 +212,12 @@ def video(key):
 HTML = '''<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>動画編集アプリ</title>
 <style>body{margin:0;background:#0b0d12;color:#fff;font-family:-apple-system,sans-serif}.w{max-width:720px;margin:auto;padding:24px 16px 60px}.card{background:#171b25;border:1px solid #303747;border-radius:18px;padding:18px;margin:16px 0}h1{font-size:28px}.sub,.note{color:#aeb6c7;line-height:1.6}.step{color:#a994ff;font-weight:bold}.upload,button,.save{display:block;border-radius:12px;padding:18px;text-align:center}input[type=file]{position:absolute;width:1px;height:1px;opacity:0}.upload{border:2px dashed #59637b;cursor:pointer}.file{display:flex;gap:8px;align-items:center;background:#10141c;margin-top:8px;padding:10px;border-radius:10px}.file span{flex:1;overflow-wrap:anywhere}.file button{width:auto;padding:8px;margin:0;background:#303747}select,button{width:100%;box-sizing:border-box;font-size:16px;color:white}select{background:#0f131b;border:1px solid #343c4d;padding:14px;border-radius:12px}button,.save{border:0;background:#7d5cff;color:#fff;font-weight:bold;margin-top:16px;text-decoration:none}button:disabled{opacity:.45}.note{font-size:13px}video{width:100%;max-height:520px;margin-top:16px}.hidden{display:none}label{display:block;margin:12px 0}progress{width:100%}</style>
 <div class="w"><form method="post" action="/logout"><input type="hidden" name="csrf" value="__CSRF__"><button>ログアウト</button></form><h1>藤原専用・動画編集アプリ</h1><p class="sub">複数の動画を1本のMP4に。結婚式の思い出を、選んだ順番でまとめます。</p>
-<div class="card"><div class="step">STEP 1</div><h3>動画を選ぶ</h3><label class="upload" for="files">＋ 動画を選択</label><input id="files" type="file" accept="video/*" multiple><p class="note">1〜5本・合計200MB／10分以内。矢印で順番を変えられます。</p><div id="list"></div></div>
+<div class="card"><div class="step">STEP 1</div><h3>動画を選ぶ</h3><label class="upload" for="files">＋ 動画を選択</label><input id="files" type="file" accept="video/*" multiple><p class="note">1〜5本・合計2GB／10分以内。矢印で順番を変えられます。</p><p id="size" class="note" aria-live="polite"></p><div id="list"></div></div>
 <div class="card"><div class="step">STEP 2</div><h3>完成動画の画角</h3><select id="aspect"><option value="original">最初の動画に合わせる</option><option value="vertical">縦 9:16（TikTok・Reels・Shorts）</option><option value="horizontal">横 16:9（YouTube・式の記録）</option><option value="square">正方形 1:1</option></select><p class="note">人物が切れないよう、余白を付けて画角を揃えます。元の音声は残します。出力は720p相当です。</p><button id="go" disabled>動画を結合してMP4を作る</button><p class="note">この版では動画の結合と保存ができます。AIによる見どころ選択・自動字幕・BGM追加はまだ入っていません。</p></div>
 <div id="out" class="card hidden" aria-live="polite"><h3 id="message"></h3><progress id="progress"></progress><video id="preview" class="hidden" controls playsinline></video><a id="save" class="save hidden">MP4を保存</a><p id="hint" class="note"></p></div></div>
 <script>
-let selected=[],busy=false;const $=id=>document.getElementById(id);function draw(){ $('list').replaceChildren();selected.forEach((f,i)=>{const row=document.createElement('div');row.className='file';const name=document.createElement('span');name.textContent=(i+1)+'．'+f.name;row.append(name);for(const [label,delta] of [['↑',-1],['↓',1]]){const b=document.createElement('button');b.textContent=label;b.setAttribute('aria-label',f.name+'を'+(delta<0?'前':'後')+'へ');b.disabled=busy||i+delta<0||i+delta>=selected.length;b.onclick=()=>{[selected[i],selected[i+delta]]=[selected[i+delta],selected[i]];draw()};row.append(b)}$('list').append(row)});$('go').disabled=busy||!selected.length;$('files').disabled=busy;$('aspect').disabled=busy}
+let selected=[],busy=false;const $=id=>document.getElementById(id);function draw(){const total=selected.reduce((n,f)=>n+f.size,0);$('size').textContent=selected.length?selected.length+'本・合計 '+(total/(1024*1024)).toFixed(1)+' MB（上限 2GB）':''; $('list').replaceChildren();selected.forEach((f,i)=>{const row=document.createElement('div');row.className='file';const name=document.createElement('span');name.textContent=(i+1)+'．'+f.name;row.append(name);for(const [label,delta] of [['↑',-1],['↓',1]]){const b=document.createElement('button');b.textContent=label;b.setAttribute('aria-label',f.name+'を'+(delta<0?'前':'後')+'へ');b.disabled=busy||i+delta<0||i+delta>=selected.length;b.onclick=()=>{[selected[i],selected[i+delta]]=[selected[i+delta],selected[i]];draw()};row.append(b)}$('list').append(row)});$('go').disabled=busy||!selected.length;$('files').disabled=busy;$('aspect').disabled=busy}
 $('files').onchange=()=>{selected=[...$('files').files];draw()};const pause=ms=>new Promise(r=>setTimeout(r,ms));
-$('go').onclick=async()=>{if(selected.length>5||selected.reduce((n,f)=>n+f.size,0)>200*1024*1024){alert('1〜5本、合計200MB以内で選んでください。');return}busy=true;draw();$('out').classList.remove('hidden');$('preview').classList.add('hidden');$('preview').removeAttribute('src');$('save').classList.add('hidden');$('progress').classList.remove('hidden');$('message').textContent='動画を送信しています';$('hint').textContent='この画面を開いたままお待ちください。動画の長さによって数分かかります。';$('out').scrollIntoView({behavior:'smooth'});try{const body=new FormData();selected.forEach(f=>body.append('videos',f));body.append('aspect',$('aspect').value);const r=await fetch('/api/jobs',{method:'POST',headers:{'X-CSRF-Token':'__CSRF__'},body});const job=await r.json();if(!r.ok)throw Error(job.error||'送信に失敗しました');const base='/api/jobs/'+job.id;const query='?token='+encodeURIComponent(job.token);for(;;){await pause(2000);const response=await fetch(base+query);const status=await response.json();if(!response.ok)throw Error(status.error);$('message').textContent=status.message;if(status.status==='error')throw Error(status.message);if(status.status==='done'){const url=base+'/video'+query;$('preview').src=url;$('preview').classList.remove('hidden');$('save').href=url+'&download=1';$('save').download='wedding-edited.mp4';$('save').classList.remove('hidden');$('hint').textContent='保存期限は1時間です。iPhoneでは「MP4を保存」でダウンロード後、ファイルアプリから共有→「ビデオを保存」で写真に入れられます。';break}}}catch(e){$('message').textContent=e.message;$('hint').textContent='通信が切れた場合は、動画を選び直してもう一度試してください。'}finally{busy=false;$('progress').classList.add('hidden');draw()}};
+$('go').onclick=async()=>{if(selected.length>5||selected.reduce((n,f)=>n+f.size,0)>2*1024*1024*1024){alert('選択した動画は合計 '+(selected.reduce((n,f)=>n+f.size,0)/(1024*1024)).toFixed(1)+' MBです。1〜5本、合計2GB以内で選んでください。');return}busy=true;draw();$('out').classList.remove('hidden');$('preview').classList.add('hidden');$('preview').removeAttribute('src');$('save').classList.add('hidden');$('progress').classList.remove('hidden');$('message').textContent='動画を送信しています';$('hint').textContent='この画面を開いたままお待ちください。動画の長さによって数分かかります。';$('out').scrollIntoView({behavior:'smooth'});try{const body=new FormData();selected.forEach(f=>body.append('videos',f));body.append('aspect',$('aspect').value);const r=await fetch('/api/jobs',{method:'POST',headers:{'X-CSRF-Token':'__CSRF__'},body});const job=await r.json();if(!r.ok)throw Error(job.error||'送信に失敗しました');const base='/api/jobs/'+job.id;const query='?token='+encodeURIComponent(job.token);for(;;){await pause(2000);const response=await fetch(base+query);const status=await response.json();if(!response.ok)throw Error(status.error);$('message').textContent=status.message;if(status.status==='error')throw Error(status.message);if(status.status==='done'){const url=base+'/video'+query;$('preview').src=url;$('preview').classList.remove('hidden');$('save').href=url+'&download=1';$('save').download='wedding-edited.mp4';$('save').classList.remove('hidden');$('hint').textContent='保存期限は1時間です。iPhoneでは「MP4を保存」でダウンロード後、ファイルアプリから共有→「ビデオを保存」で写真に入れられます。';break}}}catch(e){$('message').textContent=e.message;$('hint').textContent='通信が切れた場合は、動画を選び直してもう一度試してください。'}finally{busy=false;$('progress').classList.add('hidden');draw()}};
 </script></html>'''
 if __name__=='__main__': app.run(host='0.0.0.0',port=int(os.environ.get('PORT',10000)))
