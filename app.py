@@ -1,6 +1,7 @@
 import os, json, secrets, shutil, subprocess, tempfile, threading, time, uuid, selectors, queue, math
 import urllib.request, urllib.error
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, send_file, session, redirect, render_template_string
 from datetime import timedelta
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -142,22 +143,32 @@ def openai_request(endpoint, data, content_type='application/json'):
         raise ValueError('AI解析の応答を確認できませんでした。区間を指定して編集することもできます。') from None
 
 def ai_ranges(folder, files, infos, job):
-    transcripts=[]
-    for i,(source,info) in enumerate(zip(files,infos)):
-        job['message']=f'{i+1}/{len(files)}本目の音声をAI解析中'
-        if not any(s['codec_type']=='audio' for s in info['streams']):
-            transcripts.append([]);continue
-        audio=folder/f'analysis{i}.wav'
-        run(['ffmpeg','-v','error','-y','-i',str(source),'-vn','-ac','1','-ar','16000',str(audio)])
-        boundary='----'+secrets.token_hex(16)
-        parts=[]
-        for name,value in [('model','whisper-1'),('response_format','verbose_json'),('timestamp_granularities[]','segment')]:
-            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
-        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\nContent-Type: audio/wav\r\n\r\n'.encode()+audio.read_bytes()+b'\r\n')
-        parts.append(f'--{boundary}--\r\n'.encode())
-        response=openai_request('audio/transcriptions',b''.join(parts),'multipart/form-data; boundary='+boundary)
-        audio.unlink(missing_ok=True)
-        transcripts.append([{'start':s['start'],'end':s['end'],'text':s['text']} for s in response.get('segments',[])])
+    transcripts=[[] for _ in files]
+    def transcribe(index):
+        source,info=files[index],infos[index]
+        if not any(s['codec_type']=='audio' for s in info['streams']): return []
+        audio=folder/f'analysis{index}.wav'
+        try:
+            run(['ffmpeg','-v','error','-y','-threads','1','-i',str(source),'-vn','-ac','1','-ar','16000',str(audio)])
+            boundary='----'+secrets.token_hex(16)
+            parts=[]
+            for name,value in [('model','whisper-1'),('response_format','verbose_json'),('timestamp_granularities[]','segment')]:
+                parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\nContent-Type: audio/wav\r\n\r\n'.encode()+audio.read_bytes()+b'\r\n')
+            parts.append(f'--{boundary}--\r\n'.encode())
+            response=openai_request('audio/transcriptions',b''.join(parts),'multipart/form-data; boundary='+boundary)
+            return [{'start':segment['start'],'end':segment['end'],'text':segment['text']} for segment in response.get('segments',[])]
+        finally:
+            audio.unlink(missing_ok=True)
+    job['message']=f'全{len(files)}本の音声をAI解析中（0本完了）'
+    # Only two requests at once; video encoding remains one job at a time.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending={pool.submit(transcribe,index):index for index in range(len(files))}
+        completed=0
+        for future in as_completed(pending):
+            transcripts[pending[future]]=future.result()
+            completed+=1
+            job['message']=f'全{len(files)}本の音声をAI解析中（{completed}本完了）'
     if not any(transcripts):
         raise ValueError('音声から見どころを判断できませんでした。残す区間を指定してください。')
     job['message']='動画全体の会話から、前振りと見どころを選んでいます'
@@ -308,6 +319,24 @@ def clean():
                 shutil.rmtree(ROOT/key, ignore_errors=True)
                 del JOBS[key]
 
+def conversion_filter(info, width, height):
+    """Drop surplus frames and shrink before rotating camera originals."""
+    video = next(s for s in info['streams'] if s['codec_type']=='video')
+    rotation = float(video.get('tags',{}).get('rotate',0))
+    for side in video.get('side_data_list',[]):
+        rotation = float(side.get('rotation',rotation))
+    angle = rotation % 360
+    # Leave unusual display transforms to FFmpeg's normal autorotation.
+    manual = angle in (0,90,180,270)
+    sw,sh = (height,width) if manual and angle in (90,270) else (width,height)
+    filters = f'fps=30,scale={sw}:{sh}:flags=fast_bilinear:force_original_aspect_ratio=decrease:force_divisible_by=2'
+    if manual:
+        if angle == 90: filters += ',transpose=cclock'
+        elif angle == 270: filters += ',transpose=clock'
+        elif angle == 180: filters += ',hflip,vflip'
+    filters += f',pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p'
+    return manual,filters
+
 def render(key, files, aspect):
     job = JOBS[key]
     folder = ROOT/key
@@ -337,6 +366,7 @@ def render(key, files, aspect):
         duration=sum(item[3] for item in items)
         if not items: raise ValueError('残す区間がありません。区間を指定してください。')
         job['selection_summary']=f'残す区間：{len(items)}箇所（素材順・時間順）' if not whole else '全編を使用'
+        job['render_started']=time.time()
         same_aspect = aspect_matches(infos, aspect)
         reason = '区間の切り出し・画角変更・編集効果のため' if not same_aspect or not whole or style not in ('full','tempo','reach') else '映像の形式・解像度・撮影設定が異なるため'
         if same_aspect and whole and style in ('full','tempo','reach') and copy_compatible(infos, video_only=True):
@@ -363,15 +393,18 @@ def render(key, files, aspect):
         for i,(source,info,start,d) in enumerate(items):
             job['message'] = f'{i+1}/{len(items)}区間目を変換中（{reason}）'
             audio = any(s['codec_type']=='audio' for s in info['streams'])
-            cmd = ['ffmpeg','-hide_banner','-loglevel','error','-y','-threads','1','-filter_threads','1','-ss',str(start),'-i',str(source)]
+            manual_rotation,vf = conversion_filter(info,w,h)
+            cmd = ['ffmpeg','-hide_banner','-loglevel','error','-y','-threads','2','-filter_threads','1','-ss',str(start)]
+            if manual_rotation: cmd += ['-noautorotate']
+            cmd += ['-i',str(source)]
             if not audio: cmd += ['-f','lavfi','-i','anullsrc=r=48000:cl=stereo']
-            vf = f'scale={w}:{h}:flags=fast_bilinear:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p'
             if style=='stylish':
                 fade = min(.35,d/2)
                 vf += f',fade=t=in:st=0:d={fade},fade=t=out:st={d-fade}:d={fade}'
             cmd += ['-map','0:v:0','-map','0:a:0' if audio else '1:a:0',
                     '-vf',vf,
-                    '-af','aresample=48000,apad','-t',str(d),'-c:v','libx264','-preset','ultrafast','-crf','20' if style=='pro' else '24','-threads','1',
+                    '-af','aresample=48000,apad','-t',str(d),'-c:v','libx264','-preset','ultrafast','-crf','20' if style=='pro' else '24','-threads','2',
+                    '-metadata:s:v:0','rotate=0',
                     '-c:a','aac','-ac','2','-ar','48000','-b:a','128k',str(folder/f'clip{i}.mp4')]
             run_conversion(cmd, job, completed, d, duration)
             completed += d
@@ -475,7 +508,7 @@ def list_jobs():
                                settings= SNS[job.get('sns','original')]+' ／ '+job.get('genre',GENRES[0])+' ／ '+STYLES[job.get('style','full')]+' ／ '+job.get('selection_summary','区間指定あり' if any(job.get('ranges',[])) else '全編を使用'),
                                prompt=job.get('prompt',''),
                                percent=job.get('percent',0), queue_position=waiting if job['status']=='queued' else 0,
-                               elapsed=int(job.get('finished',time.time())-job['started']) if 'started' in job else 0))
+                               elapsed=int(job.get('finished',time.time())-job.get('render_started',job['started'])) if 'started' in job else 0))
     return jsonify(jobs=list(reversed(result)), max_active=MAX_ACTIVE_JOBS)
 
 @app.get('/api/jobs/current')
@@ -498,7 +531,7 @@ def authorized(key):
 def status(key):
     job=authorized(key)
     if not job: return jsonify(error='動画が見つかりません。保存期限は1時間です。'),404
-    return jsonify(status=job['status'],message=job['message'],percent=job.get('percent',0),elapsed=int(job.get('finished',time.time())-job['started']) if 'started' in job else 0)
+    return jsonify(status=job['status'],message=job['message'],percent=job.get('percent',0),elapsed=int(job.get('finished',time.time())-job.get('render_started',job['started'])) if 'started' in job else 0)
 
 @app.get('/api/jobs/<key>/video')
 def video(key):
@@ -696,17 +729,32 @@ async function pollJobs(){
  setTimeout(pollJobs,2000);
 }
 function sendVideos(body){return new Promise((resolve,reject)=>{
- const uploadStarted=Date.now();
+ const uploadStarted=Date.now();let loaded=0,total=0,lastProgress=uploadStarted,waitingSince=null,settled=false;
+ clearRemaining();
+ const mb=bytes=>(bytes/1024/1024).toFixed(1)+' MB';
+ function display(){
+  const now=Date.now(),elapsed=Math.max(.001,(now-uploadStarted)/1000);
+  if(waitingSince!==null){$('message').textContent='サーバーで動画の受信を確認しています';$('hint').textContent='送信 '+mb(loaded)+'・送信時間 '+remainingText(Math.round((waitingSince-uploadStarted)/1000))+'・応答待ち '+remainingText(Math.floor((now-waitingSince)/1000));return;}
+  const speed=loaded/elapsed;
+  let text='送信 '+mb(loaded)+(total?' / '+mb(total):'')+'・平均 '+mb(speed)+'/秒・経過 '+remainingText(Math.floor(elapsed));
+  if(total&&loaded>0&&elapsed>=3){text+=(now-lastProgress>=5000?'・通信の進行を確認中':'・残り約 '+remainingText(Math.max(1,Math.ceil((total-loaded)/speed)))+'（目安）');}
+  $('hint').textContent=text;
+ }
+ const timer=setInterval(display,1000);
+ function finish(error,data){if(settled)return;settled=true;clearInterval(timer);if(error)reject(error);else resolve(data);}
  const xhr=new XMLHttpRequest();xhr.open('POST','/api/jobs');xhr.setRequestHeader('X-CSRF-Token','__CSRF__');
  xhr.timeout=30*60*1000;
  xhr.upload.onprogress=event=>{
-  if(event.lengthComputable){const percent=Math.round(event.loaded/event.total*100);$('progress').max=100;$('progress').value=percent;$('message').textContent='動画を送信しています '+percent+'%';const elapsed=(Date.now()-uploadStarted)/1000;showRemaining('送信中',event.loaded>0&&elapsed>=3?elapsed*(event.total-event.loaded)/event.loaded:null);}
+  loaded=event.loaded;lastProgress=Date.now();
+  if(event.lengthComputable){total=event.total;const percent=loaded>=total?100:Math.min(99,Math.floor(loaded/total*100));$('progress').max=100;$('progress').value=percent;$('message').textContent='動画を送信しています '+percent+'%';}
+  display();
  };
- xhr.upload.onload=()=>{clearRemaining();$('hint').textContent='サーバーの応答を待っています';$('message').textContent='サーバーで動画の受信を確認しています';};
- xhr.onerror=()=>reject(Error('送信中に通信が切れました。ページを開き直して処理状況を確認してください。'));
- xhr.ontimeout=()=>reject(Error('送信に30分以上かかりました。通信環境を確認してください。'));
- xhr.onload=()=>{try{const data=JSON.parse(xhr.responseText);if(xhr.status<200||xhr.status>=300)reject(Error(data.error||'送信に失敗しました'));else resolve(data);}catch(e){reject(Error('サーバーから正常な応答がありません。ページを開き直して処理状況を確認してください。'));}};
- xhr.send(body);
+ xhr.upload.onload=()=>{waitingSince=Date.now();$('progress').value=100;display();};
+ xhr.onerror=()=>finish(Error('送信中に通信が切れました。ページを開き直して処理状況を確認してください。'));
+ xhr.onabort=()=>finish(Error('送信が中断されました。ページを開き直して処理状況を確認してください。'));
+ xhr.ontimeout=()=>finish(Error('送信に30分以上かかりました。通信環境を確認してください。'));
+ xhr.onload=()=>{try{const data=JSON.parse(xhr.responseText);if(xhr.status<200||xhr.status>=300)finish(Error(data.error||'送信に失敗しました'));else finish(null,data);}catch(e){finish(Error('サーバーから正常な応答がありません。ページを開き直して処理状況を確認してください。'));}};
+ try{xhr.send(body);}catch(error){finish(error);}
 });}
 async function task(work){
  busy=true;draw();showOutput();
