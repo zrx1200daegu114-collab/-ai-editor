@@ -199,8 +199,47 @@ def run(args, timeout=900):
         raise ValueError('動画を読み込めませんでした。別の動画で試してください。')
     return p.stdout
 
+def cpu_resources():
+    result={'logical_cpus':os.cpu_count(),'quota_cpus':None,'memory_limit_bytes':None}
+    root=Path('/sys/fs/cgroup')
+    try:
+        quota,period=(root/'cpu.max').read_text().split()
+        if quota!='max': result['quota_cpus']=round(int(quota)/int(period),3)
+    except (OSError,ValueError):
+        try:
+            quota=int((root/'cpu/cpu.cfs_quota_us').read_text())
+            period=int((root/'cpu/cpu.cfs_period_us').read_text())
+            if quota>0 and period>0: result['quota_cpus']=round(quota/period,3)
+        except (OSError,ValueError): pass
+    try:
+        value=(root/'memory.max').read_text().strip()
+        if value!='max': result['memory_limit_bytes']=int(value)
+    except (OSError,ValueError): pass
+    return result
+
+def cpu_counters():
+    try:
+        values=dict(line.split() for line in Path('/sys/fs/cgroup/cpu.stat').read_text().splitlines())
+        return {key:int(values[key]) for key in ('usage_usec','nr_periods','nr_throttled','throttled_usec') if key in values}
+    except (OSError,ValueError): return {}
+
+def process_cpu_seconds(pid):
+    try:
+        stat=Path(f'/proc/{pid}/stat').read_text()
+        fields=stat[stat.rfind(')')+2:].split()
+        return (int(fields[11])+int(fields[12]))/os.sysconf('SC_CLK_TCK')
+    except (OSError,ValueError,IndexError): return None
+
+def encoding_threads():
+    quota=cpu_resources()['quota_cpus']
+    return 1 if quota is not None and quota<1 else 2
+
 def run_conversion(args, job, completed, duration, total, timeout=7200):
     started = time.monotonic()
+    counters=cpu_counters()
+    metric={'label':job.get('message','変換'),'selected_seconds':round(duration,3),
+            'elapsed_seconds':0,'output_seconds':0,'sampled_process_cpu_seconds':None,'status':'running'}
+    job.setdefault('diagnostics',{}).setdefault('conversions',[]).append(metric)
     with tempfile.TemporaryFile() as errors:
         process = subprocess.Popen(args[:-1] + ['-progress', 'pipe:1', '-nostats', args[-1]],
                                    stdout=subprocess.PIPE, stderr=errors)
@@ -209,6 +248,9 @@ def run_conversion(args, job, completed, duration, total, timeout=7200):
                 selector.register(process.stdout, selectors.EVENT_READ)
                 pending = b''
                 while True:
+                    metric['elapsed_seconds']=round(time.monotonic()-started,3)
+                    cpu=process_cpu_seconds(process.pid)
+                    if cpu is not None: metric['sampled_process_cpu_seconds']=cpu
                     if time.monotonic() - started > timeout:
                         raise subprocess.TimeoutExpired(args, timeout)
                     if not selector.select(timeout=1):
@@ -222,14 +264,20 @@ def run_conversion(args, job, completed, duration, total, timeout=7200):
                             try:
                                 seconds = min(duration, max(0, int(line.split(b'=', 1)[1]) / 1000000))
                                 job['percent'] = min(99, round(100 * (completed + seconds) / total, 2))
+                                metric['output_seconds']=round(seconds,3)
                             except ValueError: pass
             if process.wait(timeout=5):
                 raise ValueError('動画の変換に失敗しました。短い動画で試してください。')
+            metric['status']='done'
         finally:
             if process.poll() is None:
                 process.kill()
                 process.wait()
             process.stdout.close()
+            metric['elapsed_seconds']=round(time.monotonic()-started,3)
+            metric['media_seconds_per_wall_second']=round(metric['output_seconds']/max(.001,metric['elapsed_seconds']),4)
+            metric['cgroup_counter_delta']={name:max(0,value-counters[name]) for name,value in cpu_counters().items() if name in counters}
+            if metric['status']=='running': metric['status']='failed'
 
 def probe(path):
     return json.loads(run(['ffprobe','-v','error','-show_streams','-show_data','-show_format','-of','json',str(path)],30))
@@ -319,29 +367,39 @@ def clean():
                 shutil.rmtree(ROOT/key, ignore_errors=True)
                 del JOBS[key]
 
-def conversion_filter(info, width, height):
-    """Drop surplus frames and shrink before rotating camera originals."""
-    video = next(s for s in info['streams'] if s['codec_type']=='video')
-    rotation = float(video.get('tags',{}).get('rotate',0))
-    for side in video.get('side_data_list',[]):
+def video_rotation(stream):
+    rotation = float(stream.get('tags',{}).get('rotate',0))
+    for side in stream.get('side_data_list',[]):
         rotation = float(side.get('rotation',rotation))
-    angle = rotation % 360
-    # Leave unusual display transforms to FFmpeg's normal autorotation.
-    manual = angle in (0,90,180,270)
-    sw,sh = (height,width) if manual and angle in (90,270) else (width,height)
-    filters = f'fps=30,scale={sw}:{sh}:flags=fast_bilinear:force_original_aspect_ratio=decrease:force_divisible_by=2'
-    if manual:
-        if angle == 90: filters += ',transpose=cclock'
-        elif angle == 270: filters += ',transpose=clock'
-        elif angle == 180: filters += ',hflip,vflip'
-    filters += f',pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p'
-    return manual,filters
+    return rotation % 360
+
+def output_geometry(info):
+    video = next(s for s in info['streams'] if s['codec_type']=='video')
+    return dict(width=video['width'],height=video['height'],
+                rotation=video_rotation(video),sample_aspect_ratio=video.get('sample_aspect_ratio'))
+
+def verify_encoded_geometry(info, width, height):
+    geometry = output_geometry(info)
+    if (geometry['width'],geometry['height']) != (width,height) or abs(geometry['rotation']) > .01 or geometry['sample_aspect_ratio'] not in (None,'1:1'):
+        raise ValueError('動画の向きを検証できませんでした。完成として保存せず、処理を停止しました。')
+    return geometry
+
+def conversion_filter(info, width, height):
+    """Use FFmpeg's display-matrix autorotation, then fit the requested canvas."""
+    return f'fps=30,scale={width}:{height}:flags=fast_bilinear:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p'
 
 def render(key, files, aspect):
     job = JOBS[key]
     folder = ROOT/key
+    diagnostic=job.setdefault('diagnostics',{})
+    diagnostic.update(version='16',resources=cpu_resources(),requested_aspect=aspect,
+                      requested_ranges=job.get('ranges',[]),sns=job.get('sns'),genre=job.get('genre'),style=job.get('style'))
     try:
+        checking=time.monotonic()
         infos = [probe(f) for f in files]
+        diagnostic['probe_seconds']=round(time.monotonic()-checking,3)
+        diagnostic['sources']=[dict(index=i,bytes=source.stat().st_size,duration_seconds=float(info.get('format',{}).get('duration',0)),
+            streams=[{field:stream.get(field) for field in ('codec_type','codec_name','profile','width','height','pix_fmt','r_frame_rate','avg_frame_rate','sample_rate','channels','sample_aspect_ratio')} | (dict(rotation=video_rotation(stream)) if stream['codec_type']=='video' else {}) for stream in info['streams'] if stream['codec_type'] in ('audio','video')]) for i,(source,info) in enumerate(zip(files,infos))]
         duration = 0
         for info in infos:
             videos = [s for s in info['streams'] if s['codec_type']=='video']
@@ -355,7 +413,9 @@ def render(key, files, aspect):
         mandatory=job.get('ranges',[[] for _ in files])
         for ranges,info in zip(mandatory,infos):
             merge_ranges(ranges,float(info['format']['duration']))
+        checking=time.monotonic()
         automatic=ai_ranges(folder,files,infos,job) if style=='ai' else None
+        diagnostic['analysis_seconds']=round(time.monotonic()-checking,3)
         items=[]
         whole=True
         for source,info,keep,index in zip(files,infos,mandatory,range(len(files))):
@@ -364,6 +424,8 @@ def render(key, files, aspect):
             if ranges!=[[0,d]]: whole=False
             for start,end in ranges: items.append((source,info,start,end-start))
         duration=sum(item[3] for item in items)
+        diagnostic['selected_output_seconds']=round(duration,3)
+        diagnostic['selected_intervals']=[dict(source_index=files.index(source),start=start,end=start+d) for source,info,start,d in items]
         if not items: raise ValueError('残す区間がありません。区間を指定してください。')
         job['selection_summary']=f'残す区間：{len(items)}箇所（素材順・時間順）' if not whole else '全編を使用'
         job['render_started']=time.time()
@@ -372,6 +434,10 @@ def render(key, files, aspect):
         if same_aspect and whole and style in ('full','tempo','reach') and copy_compatible(infos, video_only=True):
             try:
                 copy_merge(folder, files, infos, job, duration)
+                output=probe(folder/'result.mp4')
+                if not aspect_matches([output],aspect) or output_geometry(output) != output_geometry(infos[0]):
+                    raise ValueError('完成動画の画角が指定と一致しませんでした。')
+                diagnostic['output_geometry']=output_geometry(output)
                 job.update(status='done',message='動画が完成しました（元画質・高速結合）',percent=100)
                 return
             except (ValueError, subprocess.TimeoutExpired):
@@ -390,12 +456,13 @@ def render(key, files, aspect):
             aspect = 'vertical' if h>w else ('square' if h==w else 'horizontal')
         w,h = {'vertical':(720,1280),'horizontal':(1280,720),'square':(720,720)}[aspect]
         completed = 0
+        threads=encoding_threads()
+        diagnostic['encoding_threads']=threads
         for i,(source,info,start,d) in enumerate(items):
             job['message'] = f'{i+1}/{len(items)}区間目を変換中（{reason}）'
             audio = any(s['codec_type']=='audio' for s in info['streams'])
-            manual_rotation,vf = conversion_filter(info,w,h)
-            cmd = ['ffmpeg','-hide_banner','-loglevel','error','-y','-threads','2','-filter_threads','1','-ss',str(start)]
-            if manual_rotation: cmd += ['-noautorotate']
+            vf = conversion_filter(info,w,h)
+            cmd = ['ffmpeg','-hide_banner','-loglevel','error','-y','-threads',str(threads),'-filter_threads','1','-ss',str(start)]
             cmd += ['-i',str(source)]
             if not audio: cmd += ['-f','lavfi','-i','anullsrc=r=48000:cl=stereo']
             if style=='stylish':
@@ -403,15 +470,19 @@ def render(key, files, aspect):
                 vf += f',fade=t=in:st=0:d={fade},fade=t=out:st={d-fade}:d={fade}'
             cmd += ['-map','0:v:0','-map','0:a:0' if audio else '1:a:0',
                     '-vf',vf,
-                    '-af','aresample=48000,apad','-t',str(d),'-c:v','libx264','-preset','ultrafast','-crf','20' if style=='pro' else '24','-threads','2',
-                    '-metadata:s:v:0','rotate=0',
+                    '-af','aresample=48000,apad','-t',str(d),'-c:v','libx264','-preset','ultrafast','-crf','20' if style=='pro' else '24','-threads',str(threads),
+                    '-map_metadata','-1','-metadata:s:v:0','rotate=0',
                     '-c:a','aac','-ac','2','-ar','48000','-b:a','128k',str(folder/f'clip{i}.mp4')]
             run_conversion(cmd, job, completed, d, duration)
+            verify_encoded_geometry(probe(folder/f'clip{i}.mp4'),w,h)
             completed += d
         job['message']='MP4を仕上げています'
+        checking=time.monotonic()
         listing = folder/'concat.txt'
         listing.write_text(''.join(f"file 'clip{i}.mp4'\n" for i in range(len(items))))
         run(['ffmpeg','-hide_banner','-loglevel','error','-y','-f','concat','-safe','1','-i',str(listing),'-c','copy','-movflags','+faststart',str(folder/'result.mp4')])
+        diagnostic['output_geometry']=verify_encoded_geometry(probe(folder/'result.mp4'),w,h)
+        diagnostic['final_merge_seconds']=round(time.monotonic()-checking,3)
         job.update(status='done',message='動画が完成しました',percent=100)
     except subprocess.TimeoutExpired:
         job.update(status='error',message='サーバーの処理時間上限に達しました。動画の長さだけが原因とは限りません。')
@@ -538,6 +609,17 @@ def video(key):
     job=authorized(key)
     if not job or job['status']!='done': return jsonify(error='動画が見つかりません。'),404
     return send_file(ROOT/key/'result.mp4',mimetype='video/mp4',as_attachment=request.args.get('download')=='1',download_name='edited-video.mp4',conditional=True)
+
+@app.get('/api/jobs/<key>/diagnostics')
+def diagnostics(key):
+    job=authorized(key)
+    if not job: return jsonify(error='制作データが見つかりません。'),404
+    data=dict(job.get('diagnostics',{}),status=job['status'],percent=job.get('percent',0),
+              total_processing_seconds=round(job.get('finished',time.time())-job['started'],3) if 'started' in job else None)
+    data['notes']=['CPU時間は変換プロセスの直近サンプルです。','cgroupの制限カウンターは同じサーバーの他の処理も含みます。','計測不能な値はnullまたは空欄です。']
+    response=app.response_class(json.dumps(data,ensure_ascii=False,indent=2),mimetype='application/json')
+    response.headers['Content-Disposition']='attachment; filename="video-diagnostics.json"'
+    return response
 
 HTML = r'''<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>動画編集アプリ</title>
 <style>body{margin:0;background:#0b0d12;color:#fff;font-family:-apple-system,sans-serif}.w{max-width:720px;margin:auto;padding:24px 16px 60px}.card{background:#171b25;border:1px solid #303747;border-radius:18px;padding:18px;margin:16px 0}h1{font-size:28px}.sub,.note{color:#aeb6c7;line-height:1.6}.step{color:#a994ff;font-weight:bold}.upload,button,.save{display:block;border-radius:12px;padding:18px;text-align:center}input[type=file]{position:absolute;width:1px;height:1px;opacity:0}.upload{border:2px dashed #59637b;cursor:pointer}.file{display:flex;gap:8px;align-items:center;background:#10141c;margin-top:8px;padding:10px;border-radius:10px}.file span{flex:1;overflow-wrap:anywhere}.file button{width:auto;padding:8px;margin:0;background:#303747}select,button{width:100%;box-sizing:border-box;font-size:16px;color:white}select{background:#0f131b;border:1px solid #343c4d;padding:14px;border-radius:12px}button,.save{border:0;background:#7d5cff;color:#fff;font-weight:bold;margin-top:16px;text-decoration:none}button:disabled{opacity:.45}.note{font-size:13px}video{width:100%;max-height:520px;margin-top:16px}.hidden{display:none}.trim-editor{margin-top:14px;padding:12px;border:1px solid #343b4c;border-radius:12px}.trim-editor input[type=range]{display:block;width:100%;height:30px;margin:12px 0;accent-color:#9b82ff;border-radius:10px;touch-action:pan-y}.trim-actions,.trim-saved{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}.trim-actions button,.trim-saved button{width:auto;padding:12px;font-size:14px}.trim-saved span{flex-basis:100%}label{display:block;margin:12px 0}progress{width:100%}</style>
@@ -699,13 +781,15 @@ function updateJobs(jobs){
    const el=document.createElement('div');el.className='card';
    const settings=document.createElement('p');settings.className='note';const title=document.createElement('h3'),message=document.createElement('p'),bar=document.createElement('progress'),hint=document.createElement('p'),video=document.createElement('video'),save=document.createElement('a');
    hint.className='note';video.controls=true;video.playsInline=true;video.preload='none';video.className='hidden';save.className='save hidden';save.textContent='MP4を保存';
-   el.append(title,settings,message,bar,hint,video,save);card={el,title,settings,message,bar,hint,video,save};cards.set(job.id,card);$('jobs').append(el);
+   const diagnostics=document.createElement('a');diagnostics.className='note';diagnostics.textContent='速度の診断データを保存';diagnostics.download='video-diagnostics.json';
+   el.append(title,settings,message,bar,hint,video,save,diagnostics);card={el,title,settings,message,bar,hint,video,save,diagnostics};cards.set(job.id,card);$('jobs').append(el);
   }
   card.title.textContent=job.title;card.settings.textContent=job.settings+(job.prompt?' ／ メモ：'+job.prompt:'');card.message.textContent=job.status==='queued'?'順番待ち '+job.queue_position+'件目':job.message;
+  card.diagnostics.href='/api/jobs/'+job.id+'/diagnostics?token='+encodeURIComponent(job.token);
   card.bar.max=100;card.bar.value=job.percent;card.bar.hidden=job.status!=='processing';
   if(job.status==='processing'){
    updateEstimate(card,job,Date.now());
-   card.hint.textContent=job.percent>=99?'MP4を仕上げています':Math.floor(job.percent)+'%・残り時間を計算中';
+   card.hint.textContent=job.percent>=99?'MP4を仕上げています':card.target!==null&&card.target!==undefined?(card.target>Date.now()?'完了まで約 '+remainingText(Math.ceil((card.target-Date.now())/1000))+'（目安）':'推定を更新中。処理は継続しています'):Math.floor(job.percent)+'%・残り時間を計算中';
   }else{
    card.target=null;card.lastPercent=null;card.hint.textContent=job.status==='queued'?job.settings+'。先の編集が完成すると自動で始まります。':job.status==='done'?'完成後約1時間保存できます。サーバー再起動時は消えます。':'この編集をもう一度追加してください。';
   }
